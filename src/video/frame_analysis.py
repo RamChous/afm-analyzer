@@ -120,7 +120,7 @@ class FrameAnalyzer:
         self,
         model_size: str = "n",
         confidence_threshold: float = 0.4,
-        sample_rate: float = 1.0,
+        sample_rate: float = 3.0,
         classes: Optional[list[int]] = None,
     ):
         """
@@ -265,7 +265,7 @@ class FrameAnalyzer:
 def analyze_frames(
     file_path: str,
     model_size: str = "n",
-    sample_rate: float = 1.0,
+    sample_rate: float = 3.0,
 ) -> VideoAnalysisResult:
     """
     One-liner for use in analysis_pipeline.py.

@@ -43,7 +43,7 @@ transcription = transcribe_video(VIDEO_PATH)
 
 print(f"Язык                              : {transcription.language}")
 print(f"Длительность                      : {transcription.duration:.1f}с")
-print(f"Текст (первые 300 символов)       :")
+print(f"Текст:")
 print(f"  {transcription.full_text}...")
 
 # ───────────────────────────────────────────────
@@ -74,37 +74,86 @@ for speaker in diarization.speakers:
 # ───────────────────────────────────────────────
 # 4. Объединённый вывод
 # ───────────────────────────────────────────────
+
+def format_time(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    seconds = int(seconds % 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+
 print()
-print("=" * 50)
+print("=" * 80)
 print("ИТОГ: Участники обыска")
-print("=" * 50)
+print("=" * 80)
 
-video_count  = persons.max_count
+video_count = persons.max_count
 speech_count = diarization.num_speakers
-final_count  = max(video_count, speech_count)
+final_count = max(video_count, speech_count)
 
-print(f"По видео (YOLO)                   : {video_count} чел. (пик на {persons.peak_timestamp:.1f}с)")
-print(f"По голосу (pyannote)              : {speech_count} уникальных голоса/голосов")
-print(f"Итоговое кол-во участников        : {final_count}")
+print(
+    f"По видео (YOLO): {video_count} чел. "
+    f"(пик на {format_time(persons.peak_timestamp)})"
+)
+
+print(
+    f"По голосу (pyannote): "
+    f"{speech_count} уникальных голосов"
+)
+
+print(
+    f"Итоговое количество участников: "
+    f"{final_count}"
+)
+
 print()
-print("Участники и их речь:")
-print("-" * 50)
-for i, speaker in enumerate(diarization.speakers, 1):
-    utterances = diarization.utterances_by_speaker(speaker)
-    total_speech = sum(u.end - u.start for u in utterances)
-    print(f"СПИКЕР {i} [{speaker}] — {total_speech:.1f}с речи")
-    # Показываем первые 3 реплики как пример
-    for utt in utterances[:3]:
-        print(f"  [{utt.start:.1f}с] \"{utt.text}\"")
-    if len(utterances) > 3:
-        print(f"  ... ещё {len(utterances) - 3} реплик")
-    print()
+print("=" * 80)
+print("ПОЛНАЯ РЕЧЬ ПО СПИКЕРАМ")
+print("=" * 80)
 
-# Проверка согласованности
-print("-" * 50)
+for i, speaker in enumerate(diarization.speakers, 1):
+
+    utterances = diarization.utterances_by_speaker(speaker)
+
+    total_speech = sum(
+        u.end - u.start
+        for u in utterances
+    )
+
+    print()
+    print("=" * 80)
+    print(
+        f"СПИКЕР {i} [{speaker}] "
+        f"(время речи: {total_speech:.1f} сек)"
+    )
+    print("=" * 80)
+
+    for utt in utterances:
+
+        start_time = format_time(utt.start)
+        end_time = format_time(utt.end)
+
+        print(
+            f"[{start_time} - {end_time}] "
+            f"{utt.text}"
+        )
+
+print()
+print("-" * 80)
+
 if video_count == speech_count:
-    print(f"✓ Данные согласованы: видео и голос подтверждают {final_count} участников")
+    print(
+        f"✓ Данные согласованы: "
+        f"{final_count} участников"
+    )
+
 elif speech_count > video_count:
-    print(f"⚠ Голосов больше чем людей в кадре — возможно кто-то за камерой")
+    print(
+        "⚠ Голосов больше, чем людей в кадре "
+        "(возможно кто-то за камерой)"
+    )
+
 else:
-    print(f"⚠ Людей в кадре больше чем голосов — возможно не все говорили")
+    print(
+        "⚠ Людей в кадре больше, чем голосов "
+        "(возможно не все говорили)"
+    )

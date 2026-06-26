@@ -1,0 +1,9 @@
+faster-whisper==1.2.1
+ffmpeg-python==0.2.0
+numpy==2.5.0
+opencv-python==4.13.0.92
+pyannote-audio==4.0.5
+python-dotenv==1.2.2
+soundfile==0.14.0
+ultralytics==8.4.75
+requests>=2.31.0

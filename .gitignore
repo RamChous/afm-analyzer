@@ -1,11 +1,36 @@
 .env
+*.env
+!.env.example
 *.log
 
-__pycache__/
-*.pyc
+.venv/
+.venv.venv/
+venv/
+env/
 
-dist/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
 build/
+dist/
+
+.pytest_cache/
+.coverage
+htmlcov/
+
+.cache/
+output/
+out_speech.json
+*.wav
+
+*.pt
+*.mp4
+
+.vscode/
+.idea/
+*.swp
 
 .DS_Store
 Thumbs.db

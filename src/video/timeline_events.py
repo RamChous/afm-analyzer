@@ -1,134 +1,194 @@
 """
-person_detection.py
-Counts people from pre-computed VideoAnalysisResult (frame_analysis.py).
-Does NOT run YOLO — consumes ready FrameResult objects.
-
-Main output: speaker_count → passed to diarization.py
+timeline_events.py
+Builds a single, time-sorted timeline of events from the outputs of all
+other analyzers (frame_analysis, camera_obstruction, diarization).
+Does NOT run any models — pure aggregation. The resulting Timeline is the
+chronological view fed to the LLM analyzer.
 """
 
 import logging
-from dataclasses import dataclass
-from statistics import median
+from typing import Optional
 
-from src.video.frame_analysis import VideoAnalysisResult, FrameResult
+from src.models.video import (
+    VideoAnalysisResult,
+    ObstructionResult,
+    EventType,
+    TimelineEvent,
+    Timeline,
+)
+from src.models.speech import DiarizationResult
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Data models
-# ---------------------------------------------------------------------------
-
-@dataclass
-class PersonDetectionResult:
-    """Summary of people counts across the video."""
-    max_count: int          # peak number of people — used as speaker_count
-    median_count: float     # median across all frames
-    avg_count: float        # average across all frames
-    peak_timestamp: float   # when the most people were visible (seconds)
-
-    def to_dict(self) -> dict:
-        return {
-            "max_count": self.max_count,
-            "median_count": self.median_count,
-            "avg_count": round(self.avg_count, 2),
-            "peak_timestamp": round(self.peak_timestamp, 2),
-        }
-
-
-# ---------------------------------------------------------------------------
-# Core detector
-# ---------------------------------------------------------------------------
-
-class PersonDetector:
+class TimelineBuilder:
     """
-    Analyses VideoAnalysisResult and returns person count statistics.
+    Merges per-analyzer results into one chronological Timeline.
 
     Usage:
-        from src.video.frame_analysis import analyze_frames
-        from src.video.person_detection import PersonDetector
-
-        video_result = analyze_frames("video.mp4")
-        result = PersonDetector().count(video_result)
-
-        print(result.max_count)   # → speaker_count for diarization
+        builder = TimelineBuilder()
+        timeline = builder.build(
+            video_result=video_result,
+            obstruction=obstruction_result,   # optional
+            diarization=diarization_result,   # optional
+        )
+        for ev in timeline.events:
+            print(ev.timestamp, ev.event_type, ev.description)
     """
 
-    def count(self, video_result: VideoAnalysisResult) -> PersonDetectionResult:
+    def __init__(self, silence_threshold: float = 5.0):
         """
-        Compute person count statistics from frame detections.
-
         Args:
-            video_result: Output from FrameAnalyzer.process()
-
-        Returns:
-            PersonDetectionResult with max/median/avg counts and peak timestamp.
+            silence_threshold: паузы между репликами длиннее этого (сек)
+                               становятся событиями SILENCE.
         """
-        frames = video_result.frames
+        self.silence_threshold = silence_threshold
 
-        if not frames:
-            logger.warning("No frames to analyse in %s", video_result.file_path)
-            return PersonDetectionResult(
-                max_count=0,
-                median_count=0.0,
-                avg_count=0.0,
-                peak_timestamp=0.0,
-            )
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-        counts = [f.person_count for f in frames]
-
-        max_count = max(counts)
-        peak_frame = next(f for f in frames if f.person_count == max_count)
-
-        result = PersonDetectionResult(
-            max_count=max_count,
-            median_count=median(counts),
-            avg_count=sum(counts) / len(counts),
-            peak_timestamp=peak_frame.timestamp,
-        )
-
-        logger.info(
-            "Person detection: max=%d, median=%.1f, avg=%.2f, peak at %.1fs",
-            result.max_count, result.median_count,
-            result.avg_count, result.peak_timestamp,
-        )
-
-        return result
-
-    def count_over_time(
+    def build(
         self,
         video_result: VideoAnalysisResult,
-    ) -> list[tuple[float, int]]:
-        """
-        Returns person count at each sampled timestamp.
-        Useful for timeline_events.py.
+        obstruction: Optional[ObstructionResult] = None,
+        diarization: Optional[DiarizationResult] = None,
+    ) -> Timeline:
+        events: list[TimelineEvent] = []
 
-        Returns:
-            List of (timestamp, person_count) tuples.
-        """
-        return [(f.timestamp, f.person_count) for f in video_result.frames]
+        events.extend(self._person_count_events(video_result))
 
+        if obstruction is not None:
+            events.extend(self._obstruction_events(obstruction))
+
+        if diarization is not None:
+            events.extend(self._speaker_change_events(diarization))
+            events.extend(self._silence_events(diarization, video_result.duration))
+
+        # Единая сортировка по времени
+        events.sort(key=lambda e: e.timestamp)
+
+        logger.info("Timeline built: %d events over %.1fs",
+                    len(events), video_result.duration)
+
+        return Timeline(
+            file_path=video_result.file_path,
+            duration=video_result.duration,
+            events=events,
+        )
+
+    # ------------------------------------------------------------------
+    # Event generators
+    # ------------------------------------------------------------------
+
+    def _person_count_events(
+        self,
+        video_result: VideoAnalysisResult,
+    ) -> list[TimelineEvent]:
+        """Событие на каждое ИЗМЕНЕНИЕ числа людей в кадре (не на каждый кадр)."""
+        events: list[TimelineEvent] = []
+        prev_count: Optional[int] = None
+
+        for frame in video_result.frames:
+            count = frame.person_count
+            if prev_count is None:
+                prev_count = count
+                continue
+            if count != prev_count:
+                direction = "увеличилось" if count > prev_count else "уменьшилось"
+                events.append(TimelineEvent(
+                    timestamp=frame.timestamp,
+                    event_type=EventType.PERSON_COUNT_CHANGE,
+                    description=(
+                        f"Число людей в кадре {direction}: "
+                        f"{prev_count} → {count}"
+                    ),
+                    data={"from": prev_count, "to": count},
+                ))
+                prev_count = count
+
+        return events
+
+    def _obstruction_events(
+        self,
+        obstruction: ObstructionResult,
+    ) -> list[TimelineEvent]:
+        """Каждый интервал перекрытия камеры → интервальное событие."""
+        events: list[TimelineEvent] = []
+        for ev in obstruction.events:
+            events.append(TimelineEvent(
+                timestamp=ev.start,
+                end=ev.end,
+                event_type=EventType.OBSTRUCTION,
+                description=(
+                    f"Камера перекрыта ({ev.reason}) на {ev.duration:.1f}с"
+                ),
+                data={"reason": ev.reason, "confidence": round(ev.confidence, 3)},
+            ))
+        return events
+
+    def _speaker_change_events(
+        self,
+        diarization: DiarizationResult,
+    ) -> list[TimelineEvent]:
+        """Событие, когда говорящий сменился относительно предыдущей реплики."""
+        events: list[TimelineEvent] = []
+        prev_speaker: Optional[str] = None
+
+        for utt in diarization.utterances:
+            if utt.speaker != prev_speaker:
+                events.append(TimelineEvent(
+                    timestamp=utt.start,
+                    event_type=EventType.SPEAKER_CHANGE,
+                    description=f"Говорит {utt.speaker}",
+                    data={"speaker": utt.speaker},
+                ))
+                prev_speaker = utt.speaker
+        return events
+
+    def _silence_events(
+        self,
+        diarization: DiarizationResult,
+        video_duration: float,
+    ) -> list[TimelineEvent]:
+        """Длинные паузы между репликами → события SILENCE."""
+        events: list[TimelineEvent] = []
+        utts = sorted(diarization.utterances, key=lambda u: u.start)
+
+        for prev, nxt in zip(utts, utts[1:]):
+            gap = nxt.start - prev.end
+            if gap >= self.silence_threshold:
+                events.append(TimelineEvent(
+                    timestamp=prev.end,
+                    end=nxt.start,
+                    event_type=EventType.SILENCE,
+                    description=f"Тишина {gap:.1f}с (нет речи)",
+                    data={"gap_seconds": round(gap, 2)},
+                ))
+        return events
 
 # ---------------------------------------------------------------------------
 # Convenience function
 # ---------------------------------------------------------------------------
 
-def detect_persons(video_result: VideoAnalysisResult) -> PersonDetectionResult:
+def build_timeline(
+    video_result: VideoAnalysisResult,
+    obstruction: Optional[ObstructionResult] = None,
+    diarization: Optional[DiarizationResult] = None,
+    silence_threshold: float = 5.0,
+) -> Timeline:
+
     """
     One-liner for use in analysis_pipeline.py.
-
     Example:
-        from src.video.frame_analysis import analyze_frames
-        from src.video.person_detection import detect_persons
-        from src.speech.diarization import diarize_video
-
-        video_result   = analyze_frames("video.mp4")
-        persons        = detect_persons(video_result)
-        diarization    = diarize_video(
-            file_path="video.mp4",
-            transcription=transcription,
-            hf_token="hf_...",
-            speaker_count=persons.max_count,
+        from src.video.timeline_events import build_timeline
+        timeline = build_timeline(
+            video_result=video_result,
+            obstruction=obstruction_result,
+            diarization=diarization_result,
         )
     """
-    return PersonDetector().count(video_result)
+    return TimelineBuilder(silence_threshold=silence_threshold).build(
+        video_result=video_result,
+        obstruction=obstruction,
+        diarization=diarization,
+    )

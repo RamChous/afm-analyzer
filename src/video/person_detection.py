@@ -2,39 +2,15 @@
 person_detection.py
 Counts people from pre-computed VideoAnalysisResult (frame_analysis.py).
 Does NOT run YOLO — consumes ready FrameResult objects.
-
-Main output: speaker_count → passed to diarization.py
+Main output: max_count → passed to diarization.py
 """
 
 import logging
-from dataclasses import dataclass
 from statistics import median
 
-from src.video.frame_analysis import VideoAnalysisResult, FrameResult
+from src.models.video import VideoAnalysisResult, PersonDetectionResult
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Data models
-# ---------------------------------------------------------------------------
-
-@dataclass
-class PersonDetectionResult:
-    """Summary of people counts across the video."""
-    max_count: int          # peak number of people — used as speaker_count
-    median_count: float     # median across all frames
-    avg_count: float        # average across all frames
-    peak_timestamp: float   # when the most people were visible (seconds)
-
-    def to_dict(self) -> dict:
-        return {
-            "max_count": self.max_count,
-            "median_count": self.median_count,
-            "avg_count": round(self.avg_count, 2),
-            "peak_timestamp": round(self.peak_timestamp, 2),
-        }
-
 
 # ---------------------------------------------------------------------------
 # Core detector

@@ -1,237 +1,315 @@
+"""
+src/pipelines/analysis_pipeline.py
+Сквозной пайплайн анализа видеозаписи обыска.
+
+Стадии (каждая дорогая — кэшируется на диск):
+    1. frame_analysis   — YOLO по кадрам (video)
+    2. person_detection — счётчик людей → подсказка для диаризации
+    3. obstruction      — перекрытие камеры
+    4. extract_audio    — аудио из видео ОДИН раз (переиспользуется ниже)
+    5. transcription    — Whisper
+    6. diarization      — pyannote (использует тот же wav + подсказку по спикерам)
+    7. timeline         — сборка единой шкалы событий (без модели)
+    8. llm_analysis     — поиск нарушений (Ollama)
+    9. reports          — JSON + Excel
+
+Кэш: результат каждой дорогой стадии пиклится в cache_dir. При повторном
+запуске стадия, чей кэш валиден, не пересчитывается. Падение поздней стадии
+не теряет результаты ранних.
+"""
+
 import os
-import cv2
-import numpy as np
-from dataclasses import dataclass
-from typing import List, Dict, Any
+import pickle
+import hashlib
 import logging
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional, Callable, Any
 
-from faster_whisper import WhisperModel
-from pyannote.audio import Pipeline
-from moviepy import VideoFileClip
+from src.speech.transcription import Transcriber
+from src.speech.diarization import Diarizer
+from src.video.frame_analysis import FrameAnalyzer
+from src.video.person_detection import PersonDetector
+from src.video.camera_obstruction import CameraObstructionDetector
+from src.video.timeline_events import TimelineBuilder
+from src.llm.client import LLMClient
+from src.llm.rules import parse_rules
+from src.llm.analyzer import Analyzer
+from src.reports.json_export import export_json
+from src.reports.excel_export import export_excel
+from src.models.llm import AnalysisResult
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-@dataclass
-class SpeakerTurn:
-    speaker: str
-    start: float
-    end: float
 
 @dataclass
-class CameraViolation:
-    start_time: str
-    end_time: str
+class PipelineConfig:
+    """Все настройки прогона в одном месте."""
+    # LLM
+    llm_model: str = "qwen3:14b"
+    llm_num_ctx: int = 8192
+    hf_token: str = ""                      # из .env, не хардкод
 
-class AFMVideoAnalyzer:
-    def __init__(self, hf_token: str):
-        logger.info("Загрузка речевых моделей...")
-        self.diarization_pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1", 
-            token=hf_token
+    # пути
+    rules_path: str = "config/procedures/search_procedures.txt"
+    output_dir: str = "output"
+    cache_dir: str = ".cache"
+
+    # speech
+    whisper_model: str = "large-v3"
+    language: Optional[str] = "ru"          # домен русскоязычный → не auto
+
+    # video
+    yolo_model: str = "n"
+    sample_rate: float = 3.0
+
+    # поведение
+    use_cache: bool = True
+    use_speaker_hint: bool = False          # CV-подсказка спикеров — по умолчанию off
+    min_speakers: Optional[int] = 2         # допрос: минимум следователь+обыскиваемый
+
+
+@dataclass
+class PipelineResult:
+    """Итог прогона: что получилось и где лежит."""
+    file_path: str
+    analysis: Optional[AnalysisResult] = None
+    json_path: str = ""
+    excel_path: str = ""
+    stages_completed: list[str] = field(default_factory=list)
+    stages_failed: list[str] = field(default_factory=list)
+
+
+class AnalysisPipeline:
+    """
+    Usage:
+        from dotenv import load_dotenv
+        load_dotenv()
+
+        cfg = PipelineConfig(
+            llm_model="qwen3:14b",
+            hf_token=os.environ["HF_TOKEN"],
         )
-        self.whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
-        
-    def _format_time(self, seconds: float) -> str:
-        minutes = int(seconds // 60)
-        secs = int(seconds % 60)
-        return f"{minutes:02d}:{secs:02d}"
+        pipeline = AnalysisPipeline(cfg)
+        result = pipeline.run("video.mp4")
+        print(result.json_path, result.excel_path)
+    """
 
-    def process_audio(self, video_path: str) -> tuple[List[Dict[str, Any]], int]:
-        """Извлекает чистый звук и запускает точную транскрипцию БЕЗ учета встроенных субтитров"""
-        logger.info("[AUDIO] Конвертация видео в изолированный WAV дорожку...")
-        temp_audio_path = "temp_perfect_audio.wav"
-        
-        try:
-            video_clip = VideoFileClip(video_path)
-            video_clip.audio.write_audiofile(
-                temp_audio_path, 
-                fps=16000,          
-                nbytes=2,           
-                codec='pcm_s16le',  
-                ffmpeg_params=["-ac", "1"],
-                logger=None
+    def __init__(self, config: PipelineConfig):
+        self.cfg = config
+        Path(config.output_dir).mkdir(parents=True, exist_ok=True)
+        Path(config.cache_dir).mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def run(self, file_path: str) -> PipelineResult:
+        path = Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Файл не найден: {path}")
+
+        result = PipelineResult(file_path=str(path))
+        logger.info("=== Пайплайн запущен: %s ===", path.name)
+
+        # --- ВИДЕО ----------------------------------------------------
+        video_result = self._stage(
+            result, "frame_analysis", file_path,
+            lambda: FrameAnalyzer(
+                model_size=self.cfg.yolo_model,
+                sample_rate=self.cfg.sample_rate,
+                classes=[0],
+            ).process(file_path),
+        )
+
+        persons = None
+        obstruction = None
+        if video_result is not None:
+            persons = self._stage(
+                result, "person_detection", file_path,
+                lambda: PersonDetector().count(video_result),
             )
-            video_clip.close()
-            
-            logger.info("[AUDIO] Запуск диаризации...")
-            diar_result = self.diarization_pipeline(temp_audio_path)
-            annotation = diar_result.speaker_diarization if hasattr(diar_result, "speaker_diarization") else diar_result
-                
-            turns = []
-            unique_speakers = set()
-            for turn, _, label in annotation.itertracks(yield_label=True):
-                turns.append(SpeakerTurn(speaker=str(label), start=turn.start, end=turn.end))
-                unique_speakers.add(str(label))
-            
-            logger.info("[AUDIO] Запуск Whisper (Транскрипция только звука)...")
-            # Передаем аудио-файл temp_audio_path, чтобы Whisper вообще не видел само видео и его субтитры!
-            segments, _ = self.whisper_model.transcribe(temp_audio_path, beam_size=5)
-            
-            final_dialogue = []
-            
-            # Список стоп-слов/фраз, которые нужно молча вырезать из отчета
-            stop_phrases = ["медиазапись включена", "редактор субтитров", "субтитры", "и.бойкова"]
-            
-            for seg in segments:
-                text_clean = seg.text.strip()
-                
-                # Проверка на системный мусор
-                if any(phrase in text_clean.lower() for phrase in stop_phrases) or len(text_clean) <= 1:
-                    continue
-                    
-                seg_midpoint = (seg.start + seg.end) / 2
-                current_speaker = "Неизвестный"
-                best_distance = float("inf")
-                
-                for turn in turns:
-                    if turn.start <= seg_midpoint <= turn.end:
-                        current_speaker = turn.speaker
-                        break
-                    else:
-                        dist = min(abs(seg_midpoint - turn.start), abs(seg_midpoint - turn.end))
-                        if dist < best_distance:
-                            best_distance = dist
-                            current_speaker = turn.speaker
-                
-                try:
-                    speaker_num = int(current_speaker.split("_")[-1]) + 1
-                    speaker_display = f"Человек {speaker_num}"
-                except:
-                    speaker_display = current_speaker
+            obstruction = self._stage(
+                result, "obstruction", file_path,
+                lambda: CameraObstructionDetector().detect(video_result),
+            )
 
-                final_dialogue.append({
-                    "speaker": speaker_display,
-                    "time_str": f"{self._format_time(seg.start)} - {self._format_time(seg.end)}",
-                    "text": text_clean
-                })
-                
-            return final_dialogue, len(unique_speakers)
+        # --- АУДИО (извлекаем ОДИН раз) -------------------------------
+        audio_path, tmp_created = self._prepare_audio(path)
 
+        transcription = None
+        diarization = None
+        try:
+            transcription = self._stage(
+                result, "transcription", file_path,
+                lambda: Transcriber(
+                    model_size=self.cfg.whisper_model,
+                    language=self.cfg.language,
+                ).transcribe(audio_path),
+            )
+
+            if transcription is not None:
+                speaker_hint = None
+                if self.cfg.use_speaker_hint and persons is not None:
+                    speaker_hint = persons.max_count or None
+
+                diarization = self._stage(
+                    result, "diarization", file_path,
+                    lambda: Diarizer(hf_token=self.cfg.hf_token).diarize(
+                        file_path=file_path,
+                        transcription=transcription,
+                        speaker_count=speaker_hint,
+                        audio_path=audio_path,      # ← переиспользуем wav
+                    ),
+                )
         finally:
-            if os.path.exists(temp_audio_path):
-                try: os.remove(temp_audio_path)
-                except: pass
+            if tmp_created and os.path.exists(audio_path):
+                os.remove(audio_path)
 
-    def process_video(self, video_path: str) -> tuple[List[CameraViolation], int]:
-        """Анализ видео: точный подсчет лиц через встроенную OpenCV DNN нейросеть (без XML)"""
-        logger.info("[VIDEO] Запуск точной DNN детекции лиц OpenCV...")
-        
-        # Загружаем встроенную в OpenCV модель распознавания лиц (Caffe модель)
-        # Она поставляется вместе с opencv-python автоматически, файлы не нужны
-        model_img = os.path.join(cv2.data.haarcascades, "..", "dnn", "resnet10_ssd_iter_140000.caffemodel")
-        proto_txt = os.path.join(cv2.data.haarcascades, "..", "dnn", "deploy.prototxt")
-        
-        # Флаг: если встроенная папка DNN недоступна, используем резервный метод по яркости
-        use_dnn = os.path.exists(model_img) and os.path.exists(proto_txt)
-        if use_dnn:
-            net = cv2.dnn.readNetFromCaffe(proto_txt, model_img)
-        else:
-            logger.warning("Папка OpenCV DNN недоступна. Будет выполнен только анализ закрытия камеры.")
+        # --- TIMELINE -------------------------------------------------
+        timeline = None
+        if video_result is not None:
+            timeline = self._stage(
+                result, "timeline", file_path,
+                lambda: TimelineBuilder().build(
+                    video_result=video_result,
+                    obstruction=obstruction,
+                    diarization=diarization,
+                ),
+            )
 
-        cap = cv2.VideoCapture(video_path)
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        if fps == 0: fps = 25
-            
-        violations = []
-        max_people_in_frame = 0
-        camera_closed = False
-        closed_start_sec = 0.0
-        frame_count = 0
-        
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret: break
-                
-            frame_count += 1
-            current_sec = frame_count / fps
-            
-            # Анализируем 2 кадра в секунду для экономии ресурсов
-            if frame_count % int(fps / 2) != 0:
-                continue
-                
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            
-            # 1. Фиксация закрытия объектива
-            mean_brightness = np.mean(gray)
-            if mean_brightness < 12: 
-                if not camera_closed:
-                    camera_closed = True
-                    closed_start_sec = current_sec
-            else:
-                if camera_closed:
-                    camera_closed = False
-                    if current_sec - closed_start_sec >= 2.0:
-                        violations.append(CameraViolation(
-                            start_time=self._format_time(closed_start_sec),
-                            end_time=self._format_time(current_sec)
-                        ))
-            
-            # 2. Точный подсчет лиц через DNN нейросеть
-            if use_dnn:
-                h, w = frame.shape[:2]
-                blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 1.0, (300, 300), (104.0, 177.0, 123.0))
-                net.setInput(blob)
-                detections = net.forward()
-                
-                faces_count = 0
-                for i in range(0, detections.shape[2]):
-                    confidence = detections[0, 0, i, 2]
-                    # Учитываем только детекции с уверенностью выше 50% (отсекает ложные стулья/шкафы)
-                    if confidence > 0.5:
-                        faces_count += 1
-                        
-                if faces_count > max_people_in_frame:
-                    max_people_in_frame = faces_count
-                    
-        cap.release()
-        
-        if camera_closed and (frame_count / fps) - closed_start_sec >= 2.0:
-            violations.append(CameraViolation(
-                start_time=self._format_time(closed_start_sec),
-                end_time=self._format_time(frame_count / fps)
-            ))
-            
-        # Если DNN не отработал, ставим базовую единицу по умолчанию для MVP
-        if max_people_in_frame == 0 and not use_dnn:
-            max_people_in_frame = 1
-            
-        return violations, max_people_in_frame
+        # --- LLM-АНАЛИЗ -----------------------------------------------
+        if diarization is None:
+            logger.error("Нет диаризации — LLM-анализ невозможен. Останов.")
+            return result
 
-    def run_analysis(self, video_path: str):
-        if not os.path.exists(video_path):
-            logger.error(f"Файл {video_path} не найден!")
-            return
-            
-        dialogue, audio_speakers = self.process_audio(video_path)
-        camera_violations, max_visual_people = self.process_video(video_path)
-        
-        print("\n" + "="*60)
-        print("РЕЗУЛЬТАТ ОБРАБОТКИ ВИДЕОЗАПИСИ")
-        print("="*60)
-        
-        if dialogue:
-            for replica in dialogue:
-                print(f"{replica['speaker']} ({replica['time_str']}): {replica['text']}")
-        else:
-            print("[Полезная речь в аудиопотоке не обнаружена]")
-            
-        print("\n" + "-"*40)
-        print(f"общее количество людей распознанное по речи: {audio_speakers}")
-        print(f"общее количество людей в кадре: {max_visual_people}")
-        print("-"*40)
-        
-        print("ОБНАРУЖЕНИЕ ЗАКРЫТОЙ И ВЫКЛЮЧЕННОЙ КАМЕРЫ:")
-        if camera_violations:
-            for i, vio in enumerate(camera_violations, 1):
-                print(f"Нарушение {i}: камера была закрыта/выключена на минуте {vio.start_time} по {vio.end_time}")
-        else:
-            print("Нарушений работы камеры не обнаружено.")
-        print("="*60 + "\n")
+        analysis = self._stage(
+            result, "llm_analysis", file_path,
+            lambda: self._run_llm(file_path, diarization, timeline),
+        )
+        if analysis is None:
+            return result
+        result.analysis = analysis
 
-if __name__ == "__main__":
-    from dotenv import load_dotenv
-    load_dotenv()
-    
-    analyzer = AFMVideoAnalyzer(hf_token=os.getenv("HF_TOKEN"))
-    analyzer.run_analysis("test2.mp4")
+        # --- ОТЧЁТЫ ---------------------------------------------------
+        stem = path.stem
+        try:
+            result.json_path = export_json(
+                analysis, str(Path(self.cfg.output_dir) / f"{stem}_report.json"),
+            )
+            result.excel_path = export_excel(
+                analysis, str(Path(self.cfg.output_dir) / f"{stem}_report.xlsx"),
+            )
+            result.stages_completed.append("reports")
+        except Exception as exc:
+            logger.exception("Ошибка экспорта отчётов: %s", exc)
+            result.stages_failed.append("reports")
+
+        logger.info("=== Пайплайн завершён. Готово: %s. Сбои: %s ===",
+                    result.stages_completed, result.stages_failed or "нет")
+        return result
+
+    # ------------------------------------------------------------------
+    # LLM
+    # ------------------------------------------------------------------
+
+    def _run_llm(self, file_path, diarization, timeline) -> AnalysisResult:
+        client = LLMClient(model=self.cfg.llm_model, num_ctx=self.cfg.llm_num_ctx)
+        if not client.health_check():
+            raise RuntimeError(
+                f"Ollama недоступна или модель '{self.cfg.llm_model}' не загружена. "
+                f"Проверь: ollama list / ollama pull {self.cfg.llm_model}"
+            )
+        rules = parse_rules(self.cfg.rules_path)
+        if not rules:
+            raise RuntimeError(f"Не загружено ни одного правила из {self.cfg.rules_path}")
+        return Analyzer(client, rules).analyze(
+            file_path=file_path, diarization=diarization, timeline=timeline,
+        )
+
+    # ------------------------------------------------------------------
+    # Аудио
+    # ------------------------------------------------------------------
+
+    def _prepare_audio(self, path: Path) -> tuple[str, bool]:
+        """
+        Возвращает (audio_path, был_ли_создан_временный_файл).
+        Видео → извлекаем wav один раз. Аудио → используем как есть.
+        """
+        video_exts = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv"}
+        if path.suffix.lower() not in video_exts:
+            return str(path), False
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            wav = tmp.name
+        logger.info("Извлекаю аудио (один раз) → %s", wav)
+        Transcriber._extract_audio(str(path), wav)
+        return wav, True
+
+    # ------------------------------------------------------------------
+    # Кэш + обёртка стадии
+    # ------------------------------------------------------------------
+
+    def _stage(
+        self,
+        result: PipelineResult,
+        name: str,
+        file_path: str,
+        compute: Callable[[], Any],
+    ) -> Any:
+        """
+        Выполняет стадию с кэшем и изоляцией сбоев.
+        - кэш есть и валиден → загружаем, не считаем;
+        - стадия упала → лог + пометка в stages_failed, возвращаем None
+          (поздние стадии сами решат, могут ли работать без неё).
+        """
+        cache_file = self._cache_path(name, file_path)
+
+        if self.cfg.use_cache and cache_file.exists():
+            try:
+                with open(cache_file, "rb") as f:
+                    data = pickle.load(f)
+                logger.info("[%s] загружено из кэша", name)
+                result.stages_completed.append(name)
+                return data
+            except Exception as exc:
+                logger.warning("[%s] кэш повреждён (%s) — пересчитываю", name, exc)
+
+        logger.info("[%s] выполняю...", name)
+        try:
+            data = compute()
+        except Exception as exc:
+            logger.exception("[%s] СБОЙ: %s", name, exc)
+            result.stages_failed.append(name)
+            return None
+
+        if self.cfg.use_cache:
+            try:
+                with open(cache_file, "wb") as f:
+                    pickle.dump(data, f)
+            except Exception as exc:
+                logger.warning("[%s] не удалось записать кэш: %s", name, exc)
+
+        result.stages_completed.append(name)
+        return data
+
+    def _cache_path(self, stage: str, file_path: str) -> Path:
+        """
+        Ключ кэша = stage + путь + размер + mtime файла + ключевые параметры.
+        Если файл изменился или поменялись параметры — кэш инвалидируется.
+        """
+        p = Path(file_path)
+        stat = p.stat()
+        params = f"{self.cfg.whisper_model}|{self.cfg.language}|{self.cfg.yolo_model}|{self.cfg.sample_rate}"
+        key = f"{stage}|{p.resolve()}|{stat.st_size}|{int(stat.st_mtime)}|{params}"
+        digest = hashlib.sha256(key.encode()).hexdigest()[:16]
+        return Path(self.cfg.cache_dir) / f"{stage}_{digest}.pkl"
+
+
+# ---------------------------------------------------------------------------
+# Convenience function
+# ---------------------------------------------------------------------------
+
+def analyze_search_video(file_path: str, config: PipelineConfig) -> PipelineResult:
+    return AnalysisPipeline(config).run(file_path)

@@ -1,124 +1,61 @@
 """
 diarization.py
-Splits audio by speakers (who spoke when) and merges the result
-with Whisper transcription segments (who said what).
-
-Flow:
-    1. Receive speaker_count hint from CV (optional but improves accuracy)
-    2. Run pyannote/speaker-diarization to get speaker turns
-    3. Merge turns with TranscriptionResult segments from transcription.py
-    4. Return DiarizationResult — list of utterances with speaker + text + timestamps
+Splits audio by speakers (who spoke when) and merges with Whisper
+transcription. Prefers word-level timestamps for precise speaker boundaries,
+falls back to segment-level when words are unavailable.
 """
 
 import logging
 import os
 import tempfile
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 import ffmpeg
+import torch
 from pyannote.audio import Pipeline
+import soundfile as sf
 
-from src.speech.transcription import TranscriptionResult, TranscriptionSegment
+from src.models.speech import (
+    TranscriptionResult,
+    TranscriptionSegment,
+    TranscriptionWord,
+    SpeakerTurn,
+    Utterance,
+    DiarizationResult,
+)
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Data models
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Utterance:
-    """
-    A single speaker turn merged with transcription text.
-    This is the main unit consumed by violation checks.
-    """
-    speaker: str            # e.g. "SPEAKER_00", "SPEAKER_01"
-    start: float            # seconds
-    end: float              # seconds
-    text: str               # transcribed text for this turn
-    confidence: float = 0.0
-
-    def to_dict(self) -> dict:
-        return {
-            "speaker": self.speaker,
-            "start": round(self.start, 2),
-            "end": round(self.end, 2),
-            "text": self.text,
-            "confidence": round(self.confidence, 4),
-        }
-
-
-@dataclass
-class SpeakerTurn:
-    """Raw diarization turn before merging with transcription."""
-    speaker: str
-    start: float
-    end: float
-
-
-@dataclass
-class DiarizationResult:
-    """Full result: speaker turns + merged utterances."""
-    file_path: str
-    num_speakers: int
-    utterances: list[Utterance] = field(default_factory=list)
-    speaker_turns: list[SpeakerTurn] = field(default_factory=list)
-
-    @property
-    def speakers(self) -> list[str]:
-        """Unique speaker labels found in the file."""
-        return sorted({u.speaker for u in self.utterances})
-
-    def utterances_by_speaker(self, speaker: str) -> list[Utterance]:
-        return [u for u in self.utterances if u.speaker == speaker]
-
-    def to_dict(self) -> dict:
-        return {
-            "file_path": self.file_path,
-            "num_speakers": self.num_speakers,
-            "speakers": self.speakers,
-            "utterances": [u.to_dict() for u in self.utterances],
-        }
-
-
-# ---------------------------------------------------------------------------
-# Core diarizer
-# ---------------------------------------------------------------------------
 
 class Diarizer:
     """
     Speaker diarization using pyannote.audio.
-
-    Accepts an optional speaker_count hint — pass the value from CV
-    (frame_analysis.py) to get more accurate speaker separation.
+    speaker_count from CV is treated as an UPPER BOUND (max_speakers) by
+    default, because "max people in frame" is not the same as the number of
+    speakers — someone may be silent on camera, or speaking off camera.
 
     Usage:
         diarizer = Diarizer(hf_token="hf_...")
         result = diarizer.diarize(
             file_path="video.mp4",
             transcription=transcription_result,
-            speaker_count=3,   # from CV; omit to auto-detect
+            speaker_count=3,            # hint from CV (used as max)
+            audio_path="cached.wav",    # optional, skips re-extraction
         )
-        for utt in result.utterances:
-            print(f"[{utt.speaker}] {utt.text}")
     """
 
-    # Overlap threshold: a transcription segment is assigned to the speaker
-    # who covers the most of its duration.
-    MIN_OVERLAP_SECONDS = 0.1
+    VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv"}
 
-    def __init__(self, hf_token: str):
-        """
-        Args:
-            hf_token: HuggingFace token — required to download pyannote models.
-                      Accept conditions at https://hf.co/pyannote/speaker-diarization-3.1
-        """
+    # Below this overlap a word/segment is considered unassigned.
+    MIN_OVERLAP_SECONDS = 0.05
+    # Gap larger than this splits an utterance even for the same speaker.
+    MAX_MERGE_GAP = 1.0
+
+    def __init__(self, hf_token: str, device: Optional[str] = None):
         self.hf_token = hf_token
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self._pipeline: Optional[Pipeline] = None
-        logger.info("Diarizer initialised")
+        logger.info("Diarizer initialised (device=%s)", self.device)
 
     # ------------------------------------------------------------------
     # Public API
@@ -129,36 +66,34 @@ class Diarizer:
         file_path: str,
         transcription: TranscriptionResult,
         speaker_count: Optional[int] = None,
+        audio_path: Optional[str] = None,
     ) -> DiarizationResult:
         """
-        Run diarization and merge with transcription.
-
         Args:
-            file_path:     Path to the original video/audio file.
+            file_path:     Original video/audio path (for the result record).
             transcription: Result from Transcriber.transcribe().
-            speaker_count: Number of speakers (hint from CV).
-                           If None — pyannote auto-detects.
-
-        Returns:
-            DiarizationResult with merged utterances.
+            speaker_count: Hint from CV — used as max_speakers.
+            audio_path:    Pre-extracted wav. If given, no re-extraction.
         """
         path = Path(file_path)
-        logger.info("Starting diarization: %s (speaker_count=%s)",
+        logger.info("Starting diarization: %s (speaker_count<=%s)",
                     path.name, speaker_count or "auto")
 
-        # Extract audio if video
-        if path.suffix.lower() in {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv"}:
+        if audio_path is not None:
+            turns = self._run_diarization(audio_path, speaker_count)
+        elif path.suffix.lower() in self.VIDEO_EXTENSIONS:
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                audio_path = tmp.name
+                tmp_audio = tmp.name
             try:
-                self._extract_audio(str(path), audio_path)
-                turns = self._run_diarization(audio_path, speaker_count)
+                self._extract_audio(str(path), tmp_audio)
+                turns = self._run_diarization(tmp_audio, speaker_count)
             finally:
-                os.unlink(audio_path)
+                if os.path.exists(tmp_audio):
+                    os.unlink(tmp_audio)
         else:
             turns = self._run_diarization(str(path), speaker_count)
 
-        utterances = self._merge_with_transcription(turns, transcription.segments)
+        utterances = self._merge(turns, transcription.segments)
         num_speakers = len({t.speaker for t in turns})
 
         logger.info("Diarization complete: %d speakers, %d utterances",
@@ -176,20 +111,18 @@ class Diarizer:
     # ------------------------------------------------------------------
 
     def _load_pipeline(self) -> Pipeline:
-        """Lazy-load pyannote pipeline (cached after first call)."""
         if self._pipeline is None:
             logger.info("Loading pyannote diarization pipeline...")
             self._pipeline = Pipeline.from_pretrained(
-                "pyannote/speaker-diarization-3.1",
+                "pyannote/speaker-diarization-community-1",
                 token=self.hf_token,
             )
-            logger.info("Pyannote pipeline loaded.")
+            self._pipeline.to(torch.device(self.device))
+            logger.info("Pyannote pipeline loaded on %s.", self.device)
         return self._pipeline
 
     @staticmethod
     def _extract_audio(video_path: str, output_wav: str) -> None:
-        """Extract mono 16 kHz WAV — same spec as transcription.py."""
-        logger.debug("Extracting audio for diarization: %s", video_path)
         try:
             (
                 ffmpeg
@@ -199,108 +132,164 @@ class Diarizer:
                 .run(quiet=True)
             )
         except ffmpeg.Error as exc:
-            raise RuntimeError(
-                f"ffmpeg failed on '{video_path}': {exc.stderr.decode()}"
-            ) from exc
+            stderr = exc.stderr.decode() if exc.stderr else str(exc)
+            raise RuntimeError(f"ffmpeg failed on '{video_path}':\n{stderr}") from exc
 
-    def _run_diarization(
-        self,
-        audio_path: str,
-        speaker_count: Optional[int],
-    ) -> list[SpeakerTurn]:
-        """Run pyannote and return raw speaker turns."""
+    def _run_diarization(self, audio_path, speaker_count):
         pipeline = self._load_pipeline()
-
         kwargs = {}
         if speaker_count is not None:
-            kwargs["num_speakers"] = speaker_count
+            kwargs["max_speakers"] = speaker_count
 
-        diarization = pipeline(audio_path, **kwargs)
+        # Читаем wav через soundfile — без torchcodec/torchaudio
+        data, sample_rate = sf.read(audio_path, dtype="float32", always_2d=True)
+        # soundfile даёт (time, channels); pyannote ждёт (channels, time)
+        waveform = torch.from_numpy(data.T)
 
-        # Вытаскиваем оригинальную аннотацию из нового DiarizeOutput
-        if hasattr(diarization, "speaker_diarization"):
-            annotation = diarization.speaker_diarization
-        else:
-            annotation = diarization
+        diarization = pipeline(
+            {"waveform": waveform, "sample_rate": sample_rate},
+            **kwargs,
+        )
+        annotation = getattr(diarization, "speaker_diarization", diarization)
 
-        # Теперь спокойно вызываем itertracks, так как annotation — это стандартный pyannote Annotation
         turns = [
-            SpeakerTurn(
-                speaker=str(label),
-                start=turn.start,
-                end=turn.end,
-            )
+            SpeakerTurn(speaker=str(label), start=turn.start, end=turn.end)
             for turn, _, label in annotation.itertracks(yield_label=True)
         ]
-
         logger.debug("Raw speaker turns: %d", len(turns))
         return turns
 
-    def _merge_with_transcription(
+    # ------------------------------------------------------------------
+    # Merge
+    # ------------------------------------------------------------------
+
+    def _merge(
+        self,
+        turns: list[SpeakerTurn],
+        segments: list[TranscriptionSegment],
+    ) -> list[Utterance]:
+        """Word-level merge when words exist, else segment-level fallback."""
+        has_words = any(seg.words for seg in segments)
+        if has_words:
+            return self._merge_by_words(turns, segments)
+        logger.info("No word timestamps — falling back to segment-level merge.")
+        return self._merge_by_segments(turns, segments)
+
+    def _merge_by_words(
         self,
         turns: list[SpeakerTurn],
         segments: list[TranscriptionSegment],
     ) -> list[Utterance]:
         """
-        Assign each transcription segment to the speaker with the most
-        temporal overlap, then group consecutive same-speaker segments
-        into utterances.
-
-        Strategy:
-            For each Whisper segment, find all speaker turns that overlap
-            with [segment.start, segment.end]. Assign the segment to the
-            speaker whose overlap duration is the longest.
+        Assign every word to the speaker active at its midpoint, then group
+        consecutive same-speaker words into utterances. This cuts speaker
+        boundaries inside long Whisper segments.
         """
+        # Flatten all words across segments in time order.
+        words: list[TranscriptionWord] = [
+            w for seg in segments for w in seg.words
+        ]
+        if not words:
+            return []
+        words.sort(key=lambda w: w.start)
+
         utterances: list[Utterance] = []
+        for w in words:
+            speaker = self._speaker_at(0.5 * (w.start + w.end), turns) or "UNKNOWN"
 
-        for seg in segments:
-            speaker, confidence = self._dominant_speaker(seg, turns)
-            if speaker is None:
-                speaker = "UNKNOWN"
-
-            # Merge with previous utterance if same speaker and close in time
             if (
                 utterances
                 and utterances[-1].speaker == speaker
-                and (seg.start - utterances[-1].end) < 1.0  # gap < 1 sec
+                and (w.start - utterances[-1].end) < self.MAX_MERGE_GAP
+            ):
+                last = utterances[-1]
+                last.text = (last.text + " " + w.word.strip()).strip()
+                last.end = w.end
+                last._probs.append(w.probability)  # type: ignore[attr-defined]
+            else:
+                utt = Utterance(
+                    speaker=speaker,
+                    start=w.start,
+                    end=w.end,
+                    text=w.word.strip(),
+                    confidence=w.probability,
+                )
+                utt._probs = [w.probability]  # type: ignore[attr-defined]
+                utterances.append(utt)
+
+        # Finalise confidence as mean word probability.
+        for utt in utterances:
+            probs = getattr(utt, "_probs", [utt.confidence])
+            utt.confidence = round(sum(probs) / len(probs), 4)
+            if hasattr(utt, "_probs"):
+                del utt._probs
+
+        return utterances
+
+    def _merge_by_segments(
+        self,
+        turns: list[SpeakerTurn],
+        segments: list[TranscriptionSegment],
+    ) -> list[Utterance]:
+        """Fallback: assign each whole segment to its dominant speaker."""
+        utterances: list[Utterance] = []
+        for seg in segments:
+            speaker, conf = self._dominant_speaker(seg.start, seg.end, turns)
+            speaker = speaker or "UNKNOWN"
+
+            if (
+                utterances
+                and utterances[-1].speaker == speaker
+                and (seg.start - utterances[-1].end) < self.MAX_MERGE_GAP
+
             ):
                 last = utterances[-1]
                 last.text = (last.text + " " + seg.text).strip()
                 last.end = seg.end
-                last.confidence = (last.confidence + confidence) / 2
+                last.confidence = round((last.confidence + conf) / 2, 4)
             else:
                 utterances.append(Utterance(
-                    speaker=speaker,
-                    start=seg.start,
-                    end=seg.end,
-                    text=seg.text,
-                    confidence=confidence,
+                    speaker=speaker, start=seg.start, end=seg.end,
+                    text=seg.text, confidence=round(conf, 4),
                 ))
-
         return utterances
+
+    def _speaker_at(self, t: float, turns: list[SpeakerTurn]) -> Optional[str]:
+        """Speaker whose turn contains time t (closest turn if none contain it)."""
+        for turn in turns:
+            if turn.start <= t <= turn.end:
+                return turn.speaker
+        # Nothing contains t — pick the nearest turn within a small window.
+        best, best_dist = None, self.MAX_MERGE_GAP
+        for turn in turns:
+            dist = turn.start - t if t < turn.start else t - turn.end
+            if 0 <= dist < best_dist:
+                best, best_dist = turn.speaker, dist
+        return best
 
     def _dominant_speaker(
         self,
-        seg: TranscriptionSegment,
+        start: float,
+        end: float,
         turns: list[SpeakerTurn],
     ) -> tuple[Optional[str], float]:
-        """
-        Find the speaker who covers the most of the segment's duration.
-        Returns (speaker_label, overlap_fraction).
-        """
-        best_speaker: Optional[str] = None
-        best_overlap = self.MIN_OVERLAP_SECONDS
-
+        """Speaker with the largest SUMMED overlap over [start, end]."""
+        overlaps: dict[str, float] = {}
         for turn in turns:
-            overlap = min(seg.end, turn.end) - max(seg.start, turn.start)
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_speaker = turn.speaker
+            ov = min(end, turn.end) - max(start, turn.start)
+            if ov > 0:
+                overlaps[turn.speaker] = overlaps.get(turn.speaker, 0.0) + ov
 
-        seg_duration = seg.end - seg.start
-        confidence = (best_overlap / seg_duration) if seg_duration > 0 else 0.0
+        if not overlaps:
+            return None, 0.0
 
-        return best_speaker, confidence
+        speaker = max(overlaps, key=overlaps.get)
+        total = overlaps[speaker]
+        if total < self.MIN_OVERLAP_SECONDS:
+            return None, 0.0
+
+        duration = end - start
+        return speaker, (total / duration if duration > 0 else 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -312,27 +301,12 @@ def diarize_video(
     transcription: TranscriptionResult,
     hf_token: str,
     speaker_count: Optional[int] = None,
+    audio_path: Optional[str] = None,
 ) -> DiarizationResult:
-    """
-    One-liner helper for use in analysis_pipeline.py.
 
-    Example:
-        from src.speech.transcription import transcribe_video
-        from src.speech.diarization import diarize_video
-
-        transcription = transcribe_video("video.mp4", language=None)
-        diarization = diarize_video(
-            file_path="video.mp4",
-            transcription=transcription,
-            hf_token="hf_...",
-            speaker_count=3,   # pass value from frame_analysis.py
-        )
-
-        for utt in diarization.utterances:
-            print(f"[{utt.speaker} {utt.start:.1f}s] {utt.text}")
-    """
     return Diarizer(hf_token=hf_token).diarize(
         file_path=file_path,
         transcription=transcription,
         speaker_count=speaker_count,
+        audio_path=audio_path,
     )

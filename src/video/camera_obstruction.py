@@ -12,66 +12,17 @@ All three are combined into ObstructionEvent objects with timestamps.
 """
 
 import logging
-from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
 
-from src.video.frame_analysis import VideoAnalysisResult, FrameResult
+from src.models.video import (
+    VideoAnalysisResult, FrameResult,
+    ObstructionEvent, ObstructionResult,
+)
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Data models
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ObstructionEvent:
-    """A detected camera obstruction interval."""
-    start: float                    # seconds
-    end: float                      # seconds
-    reason: str                     # "coverage" | "darkness" | "blur"
-    confidence: float               # 0..1
-
-    @property
-    def duration(self) -> float:
-        return round(self.end - self.start, 2)
-
-    def to_dict(self) -> dict:
-        return {
-            "start": round(self.start, 2),
-            "end": round(self.end, 2),
-            "duration": self.duration,
-            "reason": self.reason,
-            "confidence": round(self.confidence, 4),
-        }
-
-
-@dataclass
-class ObstructionResult:
-    """All obstruction events detected in a video."""
-    file_path: str
-    events: list[ObstructionEvent] = field(default_factory=list)
-
-    @property
-    def total_obstructed_seconds(self) -> float:
-        return round(sum(e.duration for e in self.events), 2)
-
-    @property
-    def has_obstructions(self) -> bool:
-        return len(self.events) > 0
-
-    def to_dict(self) -> dict:
-        return {
-            "file_path": self.file_path,
-            "has_obstructions": self.has_obstructions,
-            "total_obstructed_seconds": self.total_obstructed_seconds,
-            "events": [e.to_dict() for e in self.events],
-        }
-
 
 # ---------------------------------------------------------------------------
 # Core detector

@@ -3,18 +3,45 @@
 !.env.example
 *.log
 
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.py[cod]
+*$py.class
+.eggs/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 .venv/
 .venv.venv/
 venv/
 env/
 
-__pycache__/
-*.py[cod]
-*$py.class
-*.egg-info/
-.eggs/
-build/
-dist/
+inspectra.db
+*.sqlite3 
+
+uploads/
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+*.pt
+*.pth
+*.onnx
+.cache/
+
+/tmp/
+*.xlsx
+!docs/**/*.xlsx
+out_speech.json
 
 .pytest_cache/
 .coverage
@@ -25,12 +52,7 @@ output/
 out_speech.json
 *.wav
 
-*.pt
-*.mp4
-
+.DS_Store
 .vscode/
 .idea/
 *.swp
-
-.DS_Store
-Thumbs.db

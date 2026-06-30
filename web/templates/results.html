@@ -1,0 +1,242 @@
+{% extends "base.html" %}
+{% block title %}#{{ case.case_number }} — {{ tr['app_name'] }}{% endblock %}
+
+{% block content %}
+
+{% set verdict = analysis.verdict %}
+{% set violations = result.get('violations', []) %}
+{% set participants = result.get('participants', {}) %}
+{% set obstruction = result.get('camera_obstruction', {}) %}
+{% set transcript = result.get('transcript', {}) %}
+{% set utterances = transcript.get('utterances', []) %}
+{% set speaker_roles = result.get('speaker_roles', {}) %}
+{% set rules_checked = result.get('rules_checked', []) %}
+
+<div class="page-header">
+  <div>
+    <h1 class="page-title">{{ tr['table_case_number'] }} #{{ case.case_number }} · {{ case.search_date or case.created_at.strftime('%d.%m.%Y') }}</h1>
+    <div class="case-meta-strip">
+      <span class="case-meta-item">
+        <svg viewBox="0 0 20 20" fill="none"><path d="M5 3h7l3 3v11a1 1 0 01-1 1H5a1 1 0 01-1-1V4a1 1 0 011-1z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+        {{ analysis.video_filename }}
+      </span>
+      <span class="case-meta-item">
+        <svg viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="7" stroke="currentColor" stroke-width="1.4"/><path d="M10 6v4l2.5 2.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        {% if analysis.video_duration %}{{ '%d:%02d:%02d'|format(analysis.video_duration // 3600, (analysis.video_duration % 3600) // 60, analysis.video_duration % 60) }}{% else %}—{% endif %}
+      </span>
+      <span class="case-meta-item">
+        <svg viewBox="0 0 20 20" fill="none"><circle cx="10" cy="6.5" r="2.6" stroke="currentColor" stroke-width="1.4"/><path d="M4.5 16c0-2.8 2.5-5 5.5-5s5.5 2.2 5.5 5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>
+        {{ participants.get('total_count', '—') }} {{ tr['results_participants'] }}
+      </span>
+      {% if analysis.processing_time_seconds %}
+      <span class="case-meta-item">
+        <svg viewBox="0 0 20 20" fill="none"><path d="M5 2.5h10M7 2.5v2.7a3 3 0 001 2.24L10 9l2-1.56a3 3 0 001-2.24V2.5M7 17.5v-2.7a3 3 0 011-2.24L10 11l2 1.56a3 3 0 011 2.24v2.7" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
+        {{ tr['results_analysis_time'] }}: {{ (analysis.processing_time_seconds // 60)|int }}{{ tr['common_minutes_short'] }} {{ (analysis.processing_time_seconds % 60)|int }}{{ tr['common_seconds_short'] }}
+      </span>
+      {% endif %}
+    </div>
+  </div>
+  <div style="display: flex; gap: 8px;">
+    <a href="/cases/{{ case.id }}/export/excel" class="btn btn-secondary btn-sm">↓ {{ tr['results_excel'] }}</a>
+    <a href="/cases/{{ case.id }}/export/json" class="btn btn-secondary btn-sm">↓ {{ tr['results_json'] }}</a>
+  </div>
+</div>
+
+<!-- Verdict banner -->
+{% if verdict == 'НЕ_СООТВЕТСТВУЕТ' %}
+<div class="verdict-banner v-noncompliant">
+  <svg class="verdict-icon" viewBox="0 0 20 20" fill="none"><path d="M10 1.7l8.3 14.4a1 1 0 01-.86 1.5H2.56a1 1 0 01-.87-1.5L10 1.7z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M10 7.5v4M10 14.2h.01" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+  <div>
+    <p class="verdict-title">{{ tr['verdict_non_compliant'] }} — {{ tr['verdict_violations_found'].format(n=violations|length) }}</p>
+    <p class="verdict-desc">{{ analysis.llm_summary }}</p>
+  </div>
+</div>
+{% elif verdict == 'ЧАСТИЧНО_СООТВЕТСТВУЕТ' %}
+<div class="verdict-banner v-partial">
+  <svg class="verdict-icon" viewBox="0 0 20 20" fill="none"><path d="M10 1.7l8.3 14.4a1 1 0 01-.86 1.5H2.56a1 1 0 01-.87-1.5L10 1.7z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M10 7.5v4M10 14.2h.01" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+  <div>
+    <p class="verdict-title">{{ tr['verdict_partial'] }} — {{ tr['verdict_violations_found'].format(n=violations|length) }}</p>
+    <p class="verdict-desc">{{ analysis.llm_summary }}</p>
+  </div>
+</div>
+{% else %}
+<div class="verdict-banner v-compliant">
+  <svg class="verdict-icon" viewBox="0 0 20 20" fill="none"><path d="M16.7 5.5L8 14.2l-4.7-4.7" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  <div>
+    <p class="verdict-title">{{ tr['verdict_compliant'] }} — {{ tr['verdict_no_violations'] }}</p>
+    <p class="verdict-desc">{{ analysis.llm_summary }}</p>
+  </div>
+</div>
+{% endif %}
+
+<div class="results-grid">
+
+  <!-- LEFT COLUMN -->
+  <div class="results-col">
+
+    <!-- Violations -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-header-title">⚠ {{ tr['panel_violations'] }}</span>
+        <span class="card-header-sub">{{ tr['panel_violations_found'].format(n=violations|length) }}</span>
+      </div>
+      <div class="card-body">
+        {% if violations %}
+        <div class="violation-list">
+          {% for v in violations %}
+          {% set sev = v.severity %}
+          <div class="violation-card sev-{{ sev }}">
+            <div class="violation-top">
+              <span class="severity-tag sev-{{ sev }}">{{ tr['severity_' + sev] }}</span>
+              <span class="violation-timestamp">{{ '%02d:%02d'|format((v.timestamp // 60)|int, (v.timestamp % 60)|int) }}</span>
+            </div>
+            <p class="violation-title">{{ v.rule_text }}</p>
+            {% if v.reasoning %}<p class="violation-desc">{{ v.reasoning }}</p>{% endif %}
+            {% if v.quote %}<p class="violation-quote">«{{ v.quote }}»</p>{% endif %}
+            <div class="violation-footer">
+              <span>{{ tr['rule_label'] }}: {{ v.rule_id }}</span>
+              {% if v.stage %}<span>{{ tr['stage_label'] }}: {{ v.stage }}</span>{% endif %}
+              <span>{{ (v.confidence * 100)|round|int }}%</span>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="no-violations-compact">
+          <span class="check-dot-lg">
+            <svg viewBox="0 0 20 20" fill="none"><path d="M16.7 5.5L8 14.2l-4.7-4.7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </span>
+          <div>
+            <p class="no-violations-title">{{ tr['panel_no_violations_title'] }}</p>
+            <p class="no-violations-sub">{{ tr['panel_no_violations_sub'] }}</p>
+          </div>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Transcript -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-header-title">📝 {{ tr['panel_transcript'] }}</span>
+        <span class="card-header-sub">{{ tr['panel_transcript_sub'] }}</span>
+      </div>
+      <div class="card-body">
+        {% if utterances %}
+        <div class="transcript-list">
+          {% for u in utterances %}
+          {% set role = speaker_roles.get(u.speaker) %}
+          {% set spk_index = u.speaker.split('_')[-1]|int if '_' in u.speaker else 0 %}
+          <div class="transcript-row">
+            <span class="transcript-time">{{ '%02d:%02d'|format((u.start // 60)|int, (u.start % 60)|int) }}</span>
+            <span class="transcript-speaker speaker-text-{{ spk_index % 6 }}">
+              {% if role and role not in ('иное', 'other', 'басқа') %}{{ tr.get('role_' + role, role) }}{% else %}{{ tr['role_unknown'] }} {{ spk_index + 1 }}{% endif %}
+            </span>
+            <span class="transcript-text">{{ u.text }}</span>
+          </div>
+          {% endfor %}
+        </div>
+        {% else %}
+        <p class="page-subtitle">—</p>
+        {% endif %}
+      </div>
+    </div>
+
+  </div>
+
+  <!-- RIGHT COLUMN -->
+  <div class="results-col">
+
+    <!-- Participants -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-header-title">👥 {{ tr['panel_participants'] }}</span>
+        <span class="card-header-sub">{{ tr['panel_participants_sub'].format(video=participants.get('by_video', '—'), voice=participants.get('by_voice', '—')) }}</span>
+      </div>
+      <div class="card-body">
+        <div class="participant-grid">
+          {% for speaker, group_utts in (utterances | groupby('speaker')) %}
+          {% set spk_index = speaker.split('_')[-1]|int if '_' in speaker else loop.index0 %}
+          {% set raw_role = speaker_roles.get(speaker) %}
+          {% set role = raw_role if raw_role and raw_role not in ('иное', 'other', 'басқа') else None %}
+          {% set speech_seconds = (group_utts | sum(attribute='end')) - (group_utts | sum(attribute='start')) %}
+          <div class="participant-card">
+            <span class="participant-avatar speaker-color-{{ spk_index % 6 }}">{{ spk_index + 1 }}</span>
+            <div>
+              <p class="participant-role">{{ tr['role_unknown'] }} {{ spk_index + 1 }}</p>
+              <p class="participant-sub">{% if role %}{{ tr.get('role_' + role, role) }} · {% endif %}{{ speech_seconds|round(1) }}{{ tr['common_seconds_short'] }}</p>
+            </div>
+          </div>
+          {% else %}
+          <p class="page-subtitle">—</p>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+
+    <!-- Video fixation / obstruction -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-header-title">📹 {{ tr['panel_video_fixation'] }}</span>
+      </div>
+      <div class="card-body">
+        {% if obstruction.get('detected') %}
+        <div class="obstruction-alert detected">
+          <p class="obstruction-alert-title">⚠ {{ tr['panel_obstruction_detected'] }}</p>
+          {% for ev in obstruction.get('events', []) %}
+          <div class="obstruction-event">
+            <span>{{ '%02d:%02d'|format((ev.start // 60)|int, (ev.start % 60)|int) }} – {{ '%02d:%02d'|format((ev.end // 60)|int, (ev.end % 60)|int) }}</span>
+            <span>{{ ev.duration }}{{ tr['common_seconds_short'] }} · {{ tr['panel_obstruction_confidence'].format(pct=(ev.confidence * 100)|round|int ~ '%') }}</span>
+          </div>
+          {% endfor %}
+        </div>
+        {% else %}
+        <div class="obstruction-alert clean">
+          <p class="obstruction-alert-title">✓ {{ tr['panel_obstruction_clean'] }}</p>
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Checklist -->
+    {% if rules_checked %}
+    <div class="card">
+      <div class="card-header">
+        <span class="card-header-title">📋 {{ tr['panel_checklist'] }}</span>
+      </div>
+      <div class="card-body card-body-flush">
+        <div class="checklist" style="padding: 6px 18px;">
+          {% set violated_rule_ids = violations | map(attribute='rule_id') | list %}
+          {% for rule in rules_checked %}
+          <div class="checklist-row">
+            <span>{{ rule.text[:46] }}{% if rule.text|length > 46 %}…{% endif %}</span>
+            {% if rule.rule_id in violated_rule_ids %}
+            <span class="checklist-status fail">
+              <svg viewBox="0 0 20 20" fill="none"><path d="M5 5l10 10M15 5L5 15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            </span>
+            {% else %}
+            <span class="checklist-status ok">
+              <svg viewBox="0 0 20 20" fill="none"><path d="M3.5 10.5l4 4 9-9" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </span>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    <!-- LLM conclusion -->
+    <div class="card">
+      <div class="card-header">
+        <span class="card-header-title">🤖 {{ tr['panel_llm_conclusion'] }}</span>
+      </div>
+      <div class="card-body">
+        <p class="llm-summary-text">{{ analysis.llm_summary }}</p>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+{% endblock %}

@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}{{ tr['processing_title'] }} — {{ tr['app_name'] }}{% endblock %}
+
+{% block content %}
+
+<div id="statusRoot" data-analysis-id="{{ analysis.id }}" data-total-steps="{{ total_steps }}">
+
+  <div class="processing-wrap">
+
+    <div id="processingError" class="processing-error-card" style="display: {% if analysis.status == 'error' %}block{% else %}none{% endif %};">
+      <p class="processing-error-title">⚠ {{ tr['processing_error_title'] }}</p>
+      <p class="processing-error-msg">{{ analysis.error_message or '' }}</p>
+      <a href="/dashboard?lang={{ lang }}" class="btn btn-secondary" style="margin-top: 12px;">{{ tr['processing_back'] }}</a>
+    </div>
+
+    <div id="processingSteps" style="display: {% if analysis.status == 'error' %}none{% else %}block{% endif %};">
+      <div class="processing-spinner"></div>
+      <h1 class="processing-title">{{ tr['processing_title'] }}</h1>
+      <p class="processing-subtitle">#{{ case.case_number }} · {{ tr['processing_subtitle'] }}</p>
+
+      <div class="processing-steps">
+        {% set step_keys = ['processing_step1','processing_step2','processing_step3','processing_step4','processing_step5','processing_step6'] %}
+        {% for i in range(1, total_steps + 1) %}
+        <div class="processing-step {% if analysis.current_step > i %}is-done{% elif analysis.current_step == i %}is-active{% endif %}" data-step="{{ i }}">
+          <span class="step-marker">
+            {% if analysis.current_step > i %}✓{% else %}{{ i }}{% endif %}
+          </span>
+          <span>{{ tr[step_keys[i-1]] }}</span>
+        </div>
+        {% endfor %}
+      </div>
+
+      <p class="processing-eta">{{ tr['processing_eta'] }} ~5-15 {{ tr['common_minutes_short'] }}</p>
+    </div>
+
+    <div style="margin-top:25px;text-align:center">
+      <form method="post"
+      action="/analysis/{{ analysis.id }}/cancel">
+      <button class="btn btn-danger">
+        {{ tr['cancel_analysis'] }}
+      </button>
+    </form>
+  </div>
+
+  </div>
+
+</div>
+
+{% endblock %}

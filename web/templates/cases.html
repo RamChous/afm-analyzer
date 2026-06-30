@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block title %}{{ tr['cases_title'] }} — {{ tr['app_name'] }}{% endblock %}
+
+{% block content %}
+
+<div class="page-header">
+  <div>
+    <h1 class="page-title">{{ tr['cases_title'] }}</h1>
+    <p class="page-subtitle">{{ tr['cases_subtitle'] }}</p>
+  </div>
+  <a href="/upload?lang={{ lang }}" class="btn btn-primary">+ {{ tr['nav_upload'] }}</a>
+</div>
+
+<div class="card">
+  {% if cases %}
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>{{ tr['table_case_number'] }}</th>
+          <th>{{ tr['table_date'] }}</th>
+          <th>{{ tr['table_duration'] }}</th>
+          <th>{{ tr['table_participants'] }}</th>
+          <th>{{ tr['table_violations'] }}</th>
+          <th>{{ tr['table_status'] }}</th>
+          <th>{{ tr['table_action'] }}</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for case in cases %}
+        {% set a = case.analysis %}
+        <tr>
+          <td class="cell-mono">#{{ case.case_number }}</td>
+          <td class="cell-muted">{{ case.search_date or case.created_at.strftime('%d.%m.%Y') }}</td>
+          <td class="cell-muted cell-mono">
+            {% if a and a.video_duration %}{{ '%d:%02d:%02d'|format(a.video_duration // 3600, (a.video_duration % 3600) // 60, a.video_duration % 60) }}{% else %}—{% endif %}
+          </td>
+          <td class="cell-muted">{{ a.participant_count if a and a.participant_count else '—' }}</td>
+          <td>
+            {% if a and a.status == 'done' %}
+              <span class="count-chip {% if a.violation_count %}c-nonzero{% else %}c-zero{% endif %}">{{ a.violation_count or 0 }}</span>
+            {% else %}
+              <span class="count-chip c-dash">—</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if a and a.status == 'done' %}
+              <span class="badge badge-success">{{ tr['status_done'] }}</span>
+            {% elif a and a.status == 'error' %}
+              <span class="badge badge-danger">{{ tr['status_error'] }}</span>
+            {% elif a and a.status == 'cancelled' %}
+              <span class="badge badge-secondary">{{ tr['status_cancelled'] }}</span>
+            {% else %}
+              <span class="badge badge-warning">{{ tr['status_processing'] }}</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if a and a.status == 'done' %}
+              <a href="/cases/{{ case.id }}?lang={{ lang }}" class="link-action">{{ tr['action_open'] }}</a>
+            {% elif a and a.status in ('processing', 'pending') %}
+              <a href="/status/{{ a.id }}?lang={{ lang }}" class="link-action">{{ tr['action_status'] }}</a>
+           {% elif a and a.status == 'cancelled' %}
+            <span style="color: var(--text-tertiary); font-size: 13px;">—</span>
+           {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty-state">
+    <div class="empty-state-icon">
+      <svg viewBox="0 0 24 24" fill="none"><path d="M4 7a2 2 0 012-2h3.76a2 2 0 011.4.58l1.53 1.53a2 2 0 001.41.59H18a2 2 0 012 2v8a2 2 0 01-2 2H6a2 2 0 01-2-2V7z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>
+    </div>
+    <p class="empty-state-title">{{ tr['empty_cases_title'] }}</p>
+    <p class="empty-state-sub">{{ tr['empty_cases_subtitle'] }}</p>
+    <a href="/upload?lang={{ lang }}" class="btn btn-primary">{{ tr['empty_cases_cta'] }}</a>
+  </div>
+  {% endif %}
+</div>
+
+{% endblock %}

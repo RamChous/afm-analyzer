@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="{{ lang }}" data-theme="{{ theme }}">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ tr['login_title'] }} — {{ tr['app_name'] }}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/css/base.css">
+<link rel="stylesheet" href="/static/css/components.css">
+<link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+
+<div class="login-page">
+
+  <div class="login-topbar">
+    <form method="get">
+      <select name="lang" onchange="this.form.submit()" class="lang-switch-select" style="background: var(--bg-surface-2); border: 1px solid var(--border-subtle); color: var(--text-secondary); font-size: 12.5px; font-weight: 500; border-radius: 8px; padding: 7px 10px;">
+        {% for code, label in lang_labels.items() %}
+        <option value="{{ code }}" {% if code == lang %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </form>
+    <form method="post" action="/settings/theme" onsubmit="event.preventDefault(); document.cookie='theme={{ 'light' if theme == 'dark' else 'dark' }}; max-age=31536000; path=/'; window.location.reload();">
+      <button type="submit" class="theme-toggle" title="{% if theme == 'dark' %}{{ tr['theme_toggle_to_light'] }}{% else %}{{ tr['theme_toggle_to_dark'] }}{% endif %}">
+        <svg class="icon-sun" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="3.5" stroke="currentColor" stroke-width="1.5"/><path d="M10 2.5v2M10 15.5v2M3.6 3.6l1.4 1.4M15 15l1.4 1.4M2.5 10h2M15.5 10h2M3.6 16.4L5 15M15 5l1.4-1.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+        <svg class="icon-moon" viewBox="0 0 20 20" fill="none"><path d="M17 11.5A7 7 0 018 2.6 7.5 7.5 0 1017 11.5z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+      </button>
+    </form>
+  </div>
+
+  <div class="login-card">
+    <div class="login-brand">
+      <span class="brand-badge brand-badge-lg">{{ tr['app_name_short'] }}</span>
+      <div class="brand-text">
+        <span class="login-wordmark">{{ tr['app_name'] }}</span>
+        <span class="brand-tagline">{{ tr['app_tagline'] }}</span>
+      </div>
+    </div>
+
+    <h1 class="login-title">{{ tr['login_title'] }}</h1>
+    <p class="login-subtitle">{{ tr['login_subtitle'] }}</p>
+
+    {% if error %}
+    <div class="form-error-banner">{{ error }}</div>
+    {% endif %}
+
+    <form method="post" action="/login?lang={{ lang }}">
+      <input type="hidden" name="lang" value="{{ lang }}">
+
+      <div class="form-group">
+        <label class="form-label" for="username">{{ tr['login_username'] }}</label>
+        <input
+          type="text" id="username" name="username" class="form-input"
+          placeholder="{{ tr['login_username_placeholder'] }}"
+          value="{{ username }}" autocomplete="username" autofocus required>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label" for="password">{{ tr['login_password'] }}</label>
+        <input
+          type="password" id="password" name="password" class="form-input"
+          placeholder="{{ tr['login_password_placeholder'] }}"
+          autocomplete="current-password" required>
+      </div>
+
+      <button type="submit" class="btn btn-primary btn-block">{{ tr['login_submit'] }}</button>
+    </form>
+
+    <div class="login-footer">
+      {{ tr['login_footer'] }}
+      <div class="login-confidential">
+        <svg viewBox="0 0 20 20" fill="none"><path d="M10 2.5l6 2.2v4.6c0 4-2.6 6.8-6 8.2-3.4-1.4-6-4.2-6-8.2V4.7l6-2.2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/></svg>
+        {{ tr['login_confidential'] }}
+      </div>
+    </div>
+  </div>
+
+  <footer class="login-page-footer">
+    <span class="footer-brand">Inspectra</span>
+    <span class="footer-text">{{ tr['footer_text'].format(year=2026) }}</span>
+  </footer>
+</div>
+
+</body>
+</html>
